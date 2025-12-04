@@ -1,6 +1,6 @@
 # efs-fast
 
-Fast Exhaustive Feature Selection with Linear Regression, with heavy lifting done in C using AVX2 intrinsics.
+Fast Exhaustive Feature Selection for Linear Regression, with heavy lifting done in C using AVX2 intrinsics.
 
 ## Installation
 
