@@ -29,3 +29,23 @@ winget install Microsoft.VisualStudio.2022.BuildTools --override "--passive --wa
 ```bash
 pip install git+https://github.com/DifferentiableProgramming/efs_fast.git
 ```
+
+### Example usage
+
+```python
+import numpy as np
+import pandas as pd
+from efs_fast import run_efs
+
+# Generate example data
+samples = 1000
+features = 20
+rng = np.random.default_rng()
+X = rng.standard_normal([samples, features])
+y = rng.standard_normal(samples)
+
+max_comb_len = 10
+k_folds = 5
+
+efs_results = run_efs(X, y, max_comb_len, k_folds, top_k = 100, random_state=42)
+```
