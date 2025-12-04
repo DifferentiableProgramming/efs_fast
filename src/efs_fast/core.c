@@ -4,10 +4,10 @@
 #include <math.h>
 
 #ifdef USE_SIMDE
-    #define SIMDE_ENABLE_NATIVE_ALIASES
-    #include <simde/x86/avx2.h>
+#define SIMDE_ENABLE_NATIVE_ALIASES
+#include <simde/x86/avx2.h>
 #else
-    #include <immintrin.h>
+#include <immintrin.h>
 #endif
 
 #include <omp.h>
