@@ -1,6 +1,6 @@
 # efs-fast
 
-Fast Exhaustive Feature Selection with Linear Regression using AVX2 optimized C extension.
+Fast Exhaustive Feature Selection with Linear Regression, with heavy lifting done in C using AVX2 intrinsics.
 
 ## Installation
 
