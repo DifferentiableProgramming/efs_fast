@@ -1,0 +1,22 @@
+[build-system]
+requires = ["scikit-build-core>=0.8", "numpy", "cmake", "ninja"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "efs-fast"
+version = "0.1.0"
+description = "Fast Exhaustive Feature Selection with Linear Regression"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "statsmodels"
+]
+
+[tool.scikit-build]
+wheel.packages = ["src/efs_fast"]
+build.verbose = true
+cmake.build-type = "Release"

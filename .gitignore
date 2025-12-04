@@ -1,0 +1,15 @@
+__pycache__/
+*.egg-info/
+dist/
+build/
+_skbuild/
+
+*.pyd
+*.so
+*.dylib
+*.dll
+*.obj
+*.exe
+
+.vscode/
+.idea/
