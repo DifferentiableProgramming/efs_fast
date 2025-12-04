@@ -18,7 +18,7 @@ On Mac (Clang):
 xcode-select --install
 ```
 
-On Windows (MSVC):
+On Windows (MSVC) using PowerShell:
 
 ```powershell
 winget install Microsoft.VisualStudio.2022.BuildTools --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"

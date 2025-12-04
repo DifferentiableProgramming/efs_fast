@@ -37,6 +37,65 @@ _linreg_lib.exhaustive_feature_selection.restype = ctypes.c_int
 
 
 def run_efs(X, y, max_k, k_folds=5, top_k=100, random_state=42):
+    """
+    Perform Fast Exhaustive Feature Selection using Linear Regression (OLS) and K-Fold Cross-Validation.
+
+    This function searches through all feature combinations up to size `max_k` to find the
+    subsets that minimize the Mean Absolute Percentage Error (MAPE). It uses an optimized
+    C extension with AVX2 instructions and OpenMP parallelism to accelerate the process.
+
+    An intercept (constant) term is automatically added to the feature matrix and is
+    forced into every model combination.
+
+    Parameters
+    ----------
+    X : array-like of shape (n_samples, n_features)
+        The feature matrix. Must not contain more than 30 features.
+        Data will be converted to float32 (single precision) internally.
+
+    y : array-like of shape (n_samples,)
+        The target values (dependent variable).
+        Data will be converted to float32 internally.
+
+    max_k : int
+        The maximum number of features to select (excluding the intercept).
+        The search will evaluate all combinations of size 0 to `max_k`.
+
+    k_folds : int, optional (default=5)
+        The number of folds to use for K-Fold Cross-Validation.
+
+    top_k : int, optional (default=100)
+        The number of best performing feature combinations to return.
+        If set to <= 0, all evaluated combinations are returned.
+
+    random_state : int, optional (default=42)
+        Seed used by the random number generator for K-Fold splitting.
+
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame containing the sorted results. The columns are:
+        - `combination`: A tuple of integers representing the column indices of the features
+          included in the model. The index of the added intercept term (which is `n_features`)
+          will be included in these tuples.
+        - `mape`: The average Mean Absolute Percentage Error across the K folds.
+
+        The DataFrame is sorted by `mape` in ascending order.
+
+    Raises
+    ------
+    ValueError
+        If `X` contains more than 30 features.
+
+    Notes
+    -----
+    - The metric used for evaluation is MAPE (Mean Absolute Percentage Error).
+    - To handle division by zero in MAPE, the denominator is clipped to a minimum magnitude of 1e-8.
+    - Since an intercept is appended as the last column, indices in the output `combination` tuple
+      ranging from `0` to `n_features-1` correspond to the input columns of `X`. The index
+      `n_features` corresponds to the intercept.
+    """
+
     if X.shape[1] > 30:
         raise ValueError(
             "Feature matrix contains more than 30 features which is currently not supported, aborting."
