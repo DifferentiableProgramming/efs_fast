@@ -6,19 +6,25 @@ Fast Exhaustive Feature Selection for Linear Regression, with heavy lifting done
 
 ### Step 1: Install C compiler (skip if already installed)
 
-On Linux (GCC):
+#### On Linux (GCC):
 
 ```bash
 sudo apt install build-essential
 ```
 
-On Mac (Clang):
+#### On Mac (Clang):
 
 ```bash
 xcode-select --install
 ```
 
-On Windows (MSVC) using PowerShell:
+```bash
+brew install libomp
+```
+
+To support Apple Silicon, [simde](https://github.com/simd-everywhere/simde) is used to translate AVX2 instructions into native ARM NEON instructions.
+
+#### On Windows (MSVC) using PowerShell:
 
 ```powershell
 winget install Microsoft.VisualStudio.2022.BuildTools --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"

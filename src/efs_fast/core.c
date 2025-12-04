@@ -2,7 +2,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <immintrin.h>
+
+#ifdef USE_SIMDE
+    #define SIMDE_ENABLE_NATIVE_ALIASES
+    #include <simde/x86/avx2.h>
+#else
+    #include <immintrin.h>
+#endif
+
 #include <omp.h>
 #include <stdbool.h>
 
