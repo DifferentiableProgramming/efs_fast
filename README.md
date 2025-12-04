@@ -30,7 +30,7 @@ winget install Microsoft.VisualStudio.2022.BuildTools --override "--passive --wa
 pip install git+https://github.com/DifferentiableProgramming/efs_fast.git
 ```
 
-### Example usage
+## Example usage
 
 ```python
 import numpy as np
