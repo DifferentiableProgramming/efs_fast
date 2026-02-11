@@ -6,10 +6,12 @@ import pandas as pd
 import statsmodels.api as sm
 from sklearn.model_selection import KFold
 from math import comb
+import sys
 
 _curr_dir = os.path.dirname(os.path.abspath(__file__))
 
-_lib_files = glob.glob(os.path.join(_curr_dir, "efs_lib*"))
+_lib_pattern = "efs_lib*pyd" if sys.platform == "win32" else "efs_lib*"
+_lib_files = glob.glob(os.path.join(_curr_dir, _lib_pattern))
 if not _lib_files:
     raise FileNotFoundError("Could not find the compiled efs_lib extension.")
 _lib_path = _lib_files[0]
