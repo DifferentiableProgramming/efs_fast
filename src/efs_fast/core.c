@@ -20,8 +20,9 @@
 #define EXPORT
 #endif
 
-#define ALIGN 32 
+#define ALIGN 32
 #define MAX_DIM 32
+#define LANES 8   /* AVX2 float lanes: batch up to 8 CV folds per solve */
 
 typedef struct {
     float mape;
@@ -93,39 +94,106 @@ void transpose_pad_matrix(const float* src, float* dst, int rows, int cols, int 
 }
 
 typedef struct {
-    float* XtX_fold;     
-    float* Xty_fold;     
-    float* X_test_T;     
-    float* y_test;       
-    int test_cnt;        
-    int test_cnt_pad;    
+    float* XtX_fold;
+    float* Xty_fold;
+    float* X_test_T;
+    float* y_test;
+    float* inv_denom;    /* 1/max(|y_test|,1e-8); padding rows = 0 -> contribute 0 */
+    int test_cnt;
+    int test_cnt_pad;
     int m;
 } CVFold;
 
-static inline int solve_cholesky(int n, float* A, float* b, float* x) {
-    float L[MAX_DIM * MAX_DIM];
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j <= i; j++) {
-            float sum = A[i * n + j];
-            for (int k = 0; k < j; k++) sum -= L[i * n + k] * L[j * n + k];
-            if (i == j) {
-                if (sum <= 1e-12f) return -1;
-                L[i * n + j] = sqrtf(sum);
-            } else L[i * n + j] = sum / L[j * n + j];
+/* Solve the SPD system A x = b by LDL^T. A holds its lower triangle, stride n. */
+static inline int solve_ldlt(int n, float* A, float* b, float* x) {
+    float L[MAX_DIM * MAX_DIM];   /* unit lower triangular */
+    float D[MAX_DIM];             /* pivots */
+    float invD[MAX_DIM];          /* 1/pivot */
+    float LDj[MAX_DIM];           /* L[j][p]*D[p] */
+
+    for (int j = 0; j < n; j++) {
+        for (int p = 0; p < j; p++) LDj[p] = L[j * n + p] * D[p];
+
+        float dj = A[j * n + j];
+        for (int p = 0; p < j; p++) dj -= L[j * n + p] * LDj[p];
+        if (dj <= 1e-12f) return -1;
+        D[j] = dj;
+        float invdj = 1.0f / dj;
+        invD[j] = invdj;
+
+        for (int i = j + 1; i < n; i++) {
+            float s = A[i * n + j];
+            for (int p = 0; p < j; p++) s -= L[i * n + p] * LDj[p];
+            L[i * n + j] = s * invdj;
         }
     }
-    float y[MAX_DIM];
+
+    /* forward solve L z = b (unit lower); reuse x as z buffer */
     for (int i = 0; i < n; i++) {
-        float sum = b[i];
-        for (int j = 0; j < i; j++) sum -= L[i * n + j] * y[j];
-        y[i] = sum / L[i * n + i];
+        float s = b[i];
+        for (int j = 0; j < i; j++) s -= L[i * n + j] * x[j];
+        x[i] = s;
     }
+    /* back solve L^T x = D^{-1} z (unit upper) */
     for (int i = n - 1; i >= 0; i--) {
-        float sum = y[i];
-        for (int j = i + 1; j < n; j++) sum -= L[j * n + i] * x[j];
-        x[i] = sum / L[i * n + i];
+        float s = x[i] * invD[i];
+        for (int j = i + 1; j < n; j++) s -= L[j * n + i] * x[j];
+        x[i] = s;
     }
     return 0;
+}
+
+/* LDL^T on LANES systems in parallel, one CV fold per SIMD lane. The k*k matrix
+   is read straight from the fold-minor training arrays through idxs rather than
+   copied: A[r][c] = XtX_b[(idxs[r]*m + idxs[c])*LANES] (+ridge on the diagonal),
+   b[r] = Xty_b[idxs[r]*LANES]. x gets the solution; the return mask flags lanes
+   with a non-positive pivot. */
+static inline __m256 solve_ldlt8(int k, const int* idxs, int m,
+                                 const float* XtX_b, const float* Xty_b,
+                                 __m256 ridge, __m256* x) {
+    __m256 L[MAX_DIM * MAX_DIM];
+    __m256 D[MAX_DIM];
+    __m256 invD[MAX_DIM];
+    __m256 LDj[MAX_DIM];
+    int base[MAX_DIM];
+    const __m256 eps = _mm256_set1_ps(1e-12f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    __m256 singular = _mm256_setzero_ps();
+
+    for (int r = 0; r < k; r++) base[r] = idxs[r] * m;
+
+    for (int j = 0; j < k; j++) {
+        for (int p = 0; p < j; p++) LDj[p] = _mm256_mul_ps(L[j * k + p], D[p]);
+
+        __m256 dj = _mm256_add_ps(
+            _mm256_load_ps(&XtX_b[(size_t)(base[j] + idxs[j]) * LANES]), ridge);
+        for (int p = 0; p < j; p++) dj = _mm256_fnmadd_ps(L[j * k + p], LDj[p], dj);
+
+        __m256 bad = _mm256_cmp_ps(dj, eps, _CMP_LE_OQ);
+        singular = _mm256_or_ps(singular, bad);
+        __m256 dj_safe = _mm256_blendv_ps(dj, one, bad);  /* keep bad lanes finite */
+        __m256 invdj = _mm256_div_ps(one, dj_safe);
+        D[j] = dj_safe;
+        invD[j] = invdj;
+
+        for (int i = j + 1; i < k; i++) {
+            __m256 s = _mm256_load_ps(&XtX_b[(size_t)(base[i] + idxs[j]) * LANES]);
+            for (int p = 0; p < j; p++) s = _mm256_fnmadd_ps(L[i * k + p], LDj[p], s);
+            L[i * k + j] = _mm256_mul_ps(s, invdj);
+        }
+    }
+
+    for (int i = 0; i < k; i++) {          /* forward: L z = b, z reuses x */
+        __m256 s = _mm256_load_ps(&Xty_b[(size_t)idxs[i] * LANES]);
+        for (int j = 0; j < i; j++) s = _mm256_fnmadd_ps(L[i * k + j], x[j], s);
+        x[i] = s;
+    }
+    for (int i = k - 1; i >= 0; i--) {     /* back: L^T x = D^{-1} z */
+        __m256 s = _mm256_mul_ps(x[i], invD[i]);
+        for (int j = i + 1; j < k; j++) s = _mm256_fnmadd_ps(L[j * k + i], x[j], s);
+        x[i] = s;
+    }
+    return singular;
 }
 
 static inline float compute_fold_mape(const CVFold* fold, const int* idxs, const float* beta, int k) {
@@ -133,26 +201,49 @@ static inline float compute_fold_mape(const CVFold* fold, const int* idxs, const
     int actual_n = fold->test_cnt;
     const float* X_T = fold->X_test_T;
     const float* y_true = fold->y_test;
+    const float* inv_den = fold->inv_denom;
 
     __m256 sum_ratio = _mm256_setzero_ps();
-    __m256 v_eps = _mm256_set1_ps(1e-8f);
     __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
-    
-    for (int i = 0; i < n_pad; i += 8) {
-        __m256 v_pred = _mm256_setzero_ps();
-        for (int j = 0; j < k; j++) {
-            __m256 v_beta = _mm256_set1_ps(beta[j]);
-            __m256 v_x = _mm256_load_ps(&X_T[idxs[j] * n_pad + i]);
-            v_pred = _mm256_fmadd_ps(v_beta, v_x, v_pred);
+
+    /* multiply by the precomputed reciprocal; padding rows carry 0 there */
+    #define MAPE_ACCUM(v_pred, off)                                        \
+        do {                                                               \
+            __m256 v_y = _mm256_load_ps(&y_true[i + (off)]);               \
+            __m256 diff = _mm256_sub_ps(v_y, (v_pred));                    \
+            __m256 v_diff = _mm256_and_ps(diff, sign_mask);               \
+            __m256 v_inv = _mm256_load_ps(&inv_den[i + (off)]);            \
+            sum_ratio = _mm256_fmadd_ps(v_diff, v_inv, sum_ratio);         \
+        } while (0)
+
+    /* idxs[k-1]=m-1 is the all-ones intercept column, so its term is just
+       beta[k-1]; seed the accumulators with it and drop it from the loop. */
+    int kf = k - 1;
+    __m256 v_b0 = _mm256_set1_ps(beta[kf]);
+
+    int i = 0;
+    /* four row-blocks per pass so each beta[j] is broadcast once, not per block */
+    for (; i + 32 <= n_pad; i += 32) {
+        __m256 p0 = v_b0, p1 = v_b0, p2 = v_b0, p3 = v_b0;
+        for (int j = 0; j < kf; j++) {
+            __m256 vb = _mm256_set1_ps(beta[j]);
+            const float* col = &X_T[idxs[j] * n_pad + i];
+            p0 = _mm256_fmadd_ps(vb, _mm256_load_ps(col + 0),  p0);
+            p1 = _mm256_fmadd_ps(vb, _mm256_load_ps(col + 8),  p1);
+            p2 = _mm256_fmadd_ps(vb, _mm256_load_ps(col + 16), p2);
+            p3 = _mm256_fmadd_ps(vb, _mm256_load_ps(col + 24), p3);
         }
-        __m256 v_y = _mm256_load_ps(&y_true[i]);
-        __m256 diff = _mm256_sub_ps(v_y, v_pred);
-        __m256 v_diff = _mm256_and_ps(diff, sign_mask);
-        __m256 v_abs_y = _mm256_and_ps(v_y, sign_mask);
-        __m256 v_denom = _mm256_max_ps(v_abs_y, v_eps);
-        __m256 v_ratio = _mm256_div_ps(v_diff, v_denom);
-        sum_ratio = _mm256_add_ps(sum_ratio, v_ratio);
+        MAPE_ACCUM(p0, 0);  MAPE_ACCUM(p1, 8);
+        MAPE_ACCUM(p2, 16); MAPE_ACCUM(p3, 24);
     }
+    for (; i < n_pad; i += 8) {
+        __m256 v_pred = v_b0;
+        for (int j = 0; j < kf; j++)
+            v_pred = _mm256_fmadd_ps(_mm256_set1_ps(beta[j]),
+                                     _mm256_load_ps(&X_T[idxs[j] * n_pad + i]), v_pred);
+        MAPE_ACCUM(v_pred, 0);
+    }
+    #undef MAPE_ACCUM
     return hsum256_ps(sum_ratio) / actual_n * 100.0f;
 }
 
@@ -194,15 +285,23 @@ EXPORT int exhaustive_feature_selection(
         folds[f].Xty_fold = _mm_malloc(m * sizeof(float), ALIGN);
         folds[f].X_test_T = _mm_malloc(m * cnt_pad * sizeof(float), ALIGN);
         folds[f].y_test   = _mm_malloc(cnt_pad * sizeof(float), ALIGN);
+        folds[f].inv_denom = _mm_malloc(cnt_pad * sizeof(float), ALIGN);
 
         memset(folds[f].XtX_fold, 0, m * m * sizeof(float));
         memset(folds[f].Xty_fold, 0, m * sizeof(float));
+        /* compute_fold_mape runs over the padded length; inv_denom = 0 on the
+           padding rows makes them contribute nothing whatever the prediction is,
+           and avoids reading uninitialized y for fold sizes not divisible by 8 */
+        memset(folds[f].y_test, 0, cnt_pad * sizeof(float));
+        memset(folds[f].inv_denom, 0, cnt_pad * sizeof(float));
         float* temp_X_rows = malloc(cnt * m * sizeof(float));
         int idx = 0;
         for (int i = 0; i < n; i++) {
             if (fold_indices[i] == f) {
                 float yi = y[i];
                 folds[f].y_test[idx] = yi;
+                float abs_y = fabsf(yi);
+                folds[f].inv_denom[idx] = 1.0f / (abs_y > 1e-8f ? abs_y : 1e-8f);
                 const float* Xi = &X[i * m];
                 memcpy(&temp_X_rows[idx * m], Xi, m * sizeof(float));
                 for (int r = 0; r < m; r++) {
@@ -217,6 +316,31 @@ EXPORT int exhaustive_feature_selection(
         free(temp_X_rows);
     }
     free(fold_counts);
+
+    // 2b. Training matrices laid out fold-minor, so one (r,c) entry across all
+    // folds is a contiguous LANES-load. Lanes [k_folds, LANES) hold the identity
+    // to keep them non-singular.
+    bool batched = (k_folds <= LANES);
+    float* XtX_train_b = NULL;
+    float* Xty_train_b = NULL;
+    if (batched) {
+        XtX_train_b = _mm_malloc((size_t)m * m * LANES * sizeof(float), ALIGN);
+        Xty_train_b = _mm_malloc((size_t)m * LANES * sizeof(float), ALIGN);
+        for (int r = 0; r < m; r++) {
+            for (int c = 0; c < m; c++) {
+                float g = XtX_G[r * m + c];
+                float* dst = &XtX_train_b[((size_t)r * m + c) * LANES];
+                for (int f = 0; f < LANES; f++) {
+                    dst[f] = (f < k_folds) ? (g - folds[f].XtX_fold[r * m + c])
+                                           : (r == c ? 1.0f : 0.0f);
+                }
+            }
+            float gy = Xty_G[r];
+            float* dsty = &Xty_train_b[(size_t)r * LANES];
+            for (int f = 0; f < LANES; f++)
+                dsty[f] = (f < k_folds) ? (gy - folds[f].Xty_fold[r]) : 0.0f;
+        }
+    }
 
     // 3. Task Generation
     int loop_limit = 1 << (m - 1);
@@ -242,12 +366,19 @@ EXPORT int exhaustive_feature_selection(
         }
     }
 
+    int fold_mask_bits = (1 << k_folds) - 1;
+
     #pragma omp parallel
     {
         float A_local[MAX_DIM * MAX_DIM];
         float b_local[MAX_DIM];
         float x_local[MAX_DIM];
         int idxs[MAX_DIM];
+        /* batched-path scratch (one lane per fold) */
+        __m256 x_vec[MAX_DIM];
+        float beta_store[MAX_DIM * LANES];
+        float beta_tmp[MAX_DIM];
+        const __m256 ridge_vec = _mm256_set1_ps(1e-4f);
 
         int tid = omp_get_thread_num();
         ResultItem* my_heap = use_top_k ? thread_heaps[tid] : NULL;
@@ -258,13 +389,39 @@ EXPORT int exhaustive_feature_selection(
         for (t = 0; t < total_tasks; t++) {
             int mask = valid_masks[t];
             int k = 0;
-            for (int bit = 0; bit < m - 1; bit++) {
-                if ((mask >> bit) & 1) idxs[k++] = bit;
-            }
+            for (unsigned t2 = (unsigned)mask; t2; t2 &= t2 - 1)
+                idxs[k++] = _tzcnt_u32(t2);   /* visit only the set bits */
             idxs[k++] = m - 1;
 
+            const float ridge = 1e-4f;
+            float final_mape;
+
+            if (batched) {
+                // factor all folds at once, reading the system through idxs
+                __m256 sing = solve_ldlt8(k, idxs, m, XtX_train_b, Xty_train_b,
+                                          ridge_vec, x_vec);
+                if (_mm256_movemask_ps(sing) & fold_mask_bits) {
+                    final_mape = 1e9f;
+                } else {
+                    for (int r = 0; r < k; r++)
+                        _mm256_store_ps(&beta_store[r * LANES], x_vec[r]);
+                    /* fold MAPEs are non-negative, so once the running sum can
+                       no longer beat the worst kept result there is no point
+                       finishing the rest of the folds (only once the heap fills) */
+                    float thresh = (use_top_k && my_count == top_k)
+                                       ? my_heap[0].mape * (float)k_folds : INFINITY;
+                    float fold_mapes = 0;
+                    int f;
+                    for (f = 0; f < k_folds; f++) {
+                        for (int r = 0; r < k; r++) beta_tmp[r] = beta_store[r * LANES + f];
+                        fold_mapes += compute_fold_mape(&folds[f], idxs, beta_tmp, k);
+                        if (fold_mapes >= thresh) break;
+                    }
+                    if (f < k_folds) continue;
+                    final_mape = fold_mapes / k_folds;
+                }
+            } else {
             float fold_mapes = 0;
-            const float ridge = 1e-4f; 
             bool singular = false;
 
             for (int f = 0; f < k_folds; f++) {
@@ -278,7 +435,7 @@ EXPORT int exhaustive_feature_selection(
                         A_local[r * k + c] = val;
                     }
                 }
-                if (solve_cholesky(k, A_local, b_local, x_local) == 0) {
+                if (solve_ldlt(k, A_local, b_local, x_local) == 0) {
                     fold_mapes += compute_fold_mape(&folds[f], idxs, x_local, k);
                 } else {
                     singular = true;
@@ -286,7 +443,8 @@ EXPORT int exhaustive_feature_selection(
                 }
             }
 
-            float final_mape = singular ? 1e9f : (fold_mapes / k_folds);
+            final_mape = singular ? 1e9f : (fold_mapes / k_folds);
+            }
 
             if (use_top_k) {
                 heap_insert_or_replace(my_heap, &my_count, top_k, final_mape, mask);
@@ -343,11 +501,13 @@ EXPORT int exhaustive_feature_selection(
 
     _mm_free(XtX_G);
     _mm_free(Xty_G);
+    if (batched) { _mm_free(XtX_train_b); _mm_free(Xty_train_b); }
     for(int f=0; f<k_folds; f++) {
         _mm_free(folds[f].XtX_fold);
         _mm_free(folds[f].Xty_fold);
         _mm_free(folds[f].X_test_T);
         _mm_free(folds[f].y_test);
+        _mm_free(folds[f].inv_denom);
     }
     free(folds);
     free(valid_masks);
